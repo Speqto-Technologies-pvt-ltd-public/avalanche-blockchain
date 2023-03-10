@@ -1,0 +1,12 @@
+[workspace]
+members = [
+    "avalanche-config",
+    "avalanche-config-installer",
+    "avalanche-kms",
+    "avalanche-ops",
+    "avalanched-aws",
+    "avalancheup-aws",
+    "blizzard-aws",
+    "blizzardup-aws",
+    "staking-key-cert-s3-downloader",
+]

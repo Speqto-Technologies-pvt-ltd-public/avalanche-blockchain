@@ -1,0 +1,936 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Avalanche node (amd64)"
+
+# takes about 2-minute for 3 nodes (without NLB)
+# NLB takes about 3-minute
+
+# https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/parameters-section-structure.html
+Parameters:
+  Id:
+    Type: String
+    Description: Unique identifier, prefix for all resources created below.
+
+  NetworkId:
+    Type: Number
+    Description: Avalanche network ID, used for resource tagging.
+
+  NodeKind:
+    Type: String
+    AllowedValues: ["anchor", "non-anchor"]
+    Description: Node kind.
+
+  KmsCmkArn:
+    Type: String
+    Description: KMS CMK ARN that de/encrypts resources.
+
+  AadTag:
+    Type: String
+    Description: AAD tag for envelope encryption with KMS.
+
+  S3BucketName:
+    Type: String
+    Description: S3 bucket name.
+
+  Ec2KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 SSH key name
+
+  InstanceProfileArn:
+    Type: String
+    Description: Instance profile ARN
+
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: The public subnet IDs where node instances are to be created.
+
+  SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: EC2 security group ID
+
+  ImageId:
+    Type: String
+    Default: ""
+    Description: (Optional) Custom image ID. This value overrides any AWS Systems Manager Parameter Store value specified above.
+
+  # Make sure to use the same OS version as binary builder host
+  # otherwise, it can fail with:
+  # error while loading shared libraries: libssl.so.3: cannot open shared object file: No such file or directory
+  # https://ubuntu.com/server/docs/cloud-images/amazon-ec2
+  # https://aws.amazon.com/blogs/compute/query-for-the-latest-amazon-linux-ami-ids-using-aws-systems-manager-parameter-store/
+  ImageIdSsmParameter:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/20.04/stable/current/amd64/hvm/ebs-gp2/ami-id
+    # Default: /aws/service/canonical/ubuntu/server/20.04/stable/current/arm64/hvm/ebs-gp2/ami-id
+    Description: AWS Systems Manager Parameter Store parameter of the AMI ID.
+
+  ArchType:
+    Type: String
+    AllowedValues: ["amd64", "arm64"]
+    Default: "amd64"
+    # Default: "arm64"
+    Description: The name of the CPU architecture. Used for cloudwatch agent download links.
+
+  RustOsType:
+    Type: String
+    AllowedValues: ["unknown", "ubuntu20.04"]
+    Default: "unknown"
+    Description: The name of the OS distribution and kind. Used for Rust binary download links.
+
+  # use https://github.com/gyuho/aws-manager/blob/main/src/ec2/mod.rs for better defaults
+  InstanceTypes:
+    Type: CommaDelimitedList
+    Default: c6a.xlarge,m6a.xlarge,m5.xlarge,c5.xlarge
+    # Default: c6g.4xlarge,m6g.4xlarge,r6g.4xlarge,t4g.2xlarge
+    Description: EC2 instance types
+
+  InstanceTypesCount:
+    Type: Number
+    Default: 4
+    MinValue: 1
+    MaxValue: 10
+    Description: The number of instance types
+
+  # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-ec2-launchtemplate-blockdevicemapping-ebs.html#cfn-ec2-launchtemplate-blockdevicemapping-ebs-volumetype
+  VolumeType:
+    Type: String
+    Default: gp3
+    Description: Volume type.
+
+  # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-ec2-launchtemplate-blockdevicemapping-ebs.html#cfn-ec2-launchtemplate-blockdevicemapping-ebs-volumesize
+  VolumeSize:
+    Type: Number
+    Default: 300
+    MinValue: 200
+    MaxValue: 1024
+    Description: Size of the root disk for the EC2 instances, in GiB.
+
+  # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-ec2-launchtemplate-blockdevicemapping-ebs.html#cfn-ec2-launchtemplate-blockdevicemapping-ebs-iops
+  VolumeIops:
+    Type: Number
+    Default: 3000
+    Description: The number of I/O operations per second (IOPS).
+
+  # only for gp3
+  # https://aws.amazon.com/ebs/volume-types/
+  # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-ec2-launchtemplate-blockdevicemapping-ebs.html#cfn-ec2-launchtemplate-blockdevicemapping-ebs-throughput
+  # "1000" does not work -- "InvalidParameterValue - Throughput (MiBps) to iops ratio of 0.333333 is too high; maximum is 0.250000 MiBps per iops."
+  VolumeThroughput:
+    Type: Number
+    Default: 500
+    Description: The throughput to provision for a gp3 volume, with a maximum of 1,000 MiB/s.
+
+  # no need to have bigger values when each ASG only provisions one node
+  VolumeProvisionerInitialWaitRandomSeconds:
+    Type: Number
+    Default: 10
+    MinValue: 0
+    MaxValue: 500
+    Description: Only set non-zero if multiple instances may compete for the same EBS volume in the same zone.
+
+  # as long as the IP's attached to an instance, it's free
+  IpMode:
+    Type: String
+    AllowedValues: ["elastic", "ephemeral"]
+    Default: "elastic"
+    Description: Set "elastic" to allocate Elastic IP.
+
+  InstanceMode:
+    Type: String
+    AllowedValues: ["spot", "on-demand"]
+    Default: "spot"
+    Description: Set to "spot" to run spot instance.
+
+  AsgLaunchTemplateId:
+    Type: String
+    Default: ""
+    Description: (Optional) Non-empty to reuse.
+
+  AsgLaunchTemplateVersion:
+    Type: String
+    Default: ""
+    Description: (Optional) Non-empty to reuse.
+
+  AsgName:
+    Type: String
+    Description: Unique identifier for this Asg.
+
+  AsgMinInstancesInService:
+    Type: Number
+    Description: Minimum instances in service for update.
+    Default: 1
+    MinValue: 1
+    MaxValue: 1
+
+  AsgMinSize:
+    Type: Number
+    Description: Minimum size auto scaling group
+    Default: 1
+    MinValue: 0
+    MaxValue: 1
+
+  AsgMaxSize:
+    Type: Number
+    Description: Maximum size auto scaling group
+    Default: 2
+    MinValue: 1
+    MaxValue: 2
+
+  AsgDesiredCapacity:
+    Type: Number
+    Description: Desired size auto scaling group
+    Default: 1
+    MinValue: 1
+    MaxValue: 1
+
+  OnDemandPercentageAboveBaseCapacity:
+    Type: Number
+    Default: 100
+    MinValue: 0
+    MaxValue: 100
+    Description: 0 for Spot only. 100 for On-Demand only.
+
+  NlbEnabled:
+    Type: String
+    AllowedValues: [true, false]
+    Default: false
+    Description: true to enable NLB
+
+  NlbTargetGroupArn:
+    Type: String
+    Default: ""
+    Description: NLB target group ARN for ASG
+
+  NlbVpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID
+
+  NlbHttpPort:
+    Type: Number
+    Default: 9650
+    Description: HTTP port (only required for NLB)
+
+  NlbAcmCertificateArn:
+    Type: String
+    Default: ""
+    Description: (Optional) Certificates for NLB HTTPs traffic.
+
+  AvalanchedDownloadSource:
+    Type: String
+    AllowedValues: ["github", "s3"]
+    Default: "github"
+    Description: Set to "github" to download from github, or "s3" to download from S3.
+
+  AvalanchedFlag:
+    Type: String
+    Default: ""
+    Description: (Optional) flag for "avalanched" CLI.
+
+Conditions:
+  HasImageId:
+    Fn::Not:
+      - Fn::Equals:
+          - Ref: ImageId
+          - ""
+
+  Has2InstanceTypes:
+    Fn::Or:
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 2
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 3
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 4
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 5
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 6
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 7
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 8
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 9
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 10
+
+  Has3InstanceTypes:
+    Fn::Or:
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 3
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 4
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 5
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 6
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 7
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 8
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 9
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 10
+
+  Has4InstanceTypes:
+    Fn::Or:
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 4
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 5
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 6
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 7
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 8
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 9
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 10
+
+  Has5InstanceTypes:
+    Fn::Or:
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 5
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 6
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 7
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 8
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 9
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 10
+
+  Has6InstanceTypes:
+    Fn::Or:
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 6
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 7
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 8
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 9
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 10
+
+  Has7InstanceTypes:
+    Fn::Or:
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 7
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 8
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 9
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 10
+
+  Has8InstanceTypes:
+    Fn::Or:
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 8
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 9
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 10
+
+  Has9InstanceTypes:
+    Fn::Or:
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 9
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 10
+
+  Has10InstanceTypes:
+    Fn::Equals:
+      - Ref: InstanceTypesCount
+      - 10
+
+  NlbEnabledTrue:
+    Fn::Equals:
+      - Ref: NlbEnabled
+      - "true"
+
+  NlbTargetGroupArnEmpty:
+    Fn::Equals:
+      - Ref: NlbTargetGroupArn
+      - ""
+
+  NlbAcmCertificateArnEmpty:
+    Fn::Equals:
+      - Ref: NlbAcmCertificateArn
+      - ""
+
+  # only create 1 NLB once
+  # for both anchor- and non-anchor nodes
+  CreateNlb:
+    Fn::And:
+      # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/conditions-section-structure.html
+      - Condition: NlbEnabledTrue
+      - Condition: NlbTargetGroupArnEmpty
+
+  # only create 1 HTTPs listener once
+  # for both anchor- and non-anchor nodes
+  HasNlbAcmCertificateArn:
+    Fn::And:
+      # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/conditions-section-structure.html
+      - Condition: CreateNlb
+      - Fn::Not:
+          - Condition: NlbAcmCertificateArnEmpty
+
+  # only create once
+  CreateAsgLaunchTemplate:
+    Fn::Equals:
+      - Ref: AsgLaunchTemplateId
+      - ""
+
+Resources:
+  # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-elasticloadbalancingv2-loadbalancer.html
+  # takes 3-minute
+  NLB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Condition: CreateNlb
+    Properties:
+      Type: network
+      # load balancer name '...' cannot be longer than '32' characters
+      Name: !Join ["-", [!Ref Id, "nlb"]]
+      Subnets: !Ref PublicSubnetIds
+      # load balancer name '...' cannot be longer than '32' characters
+      Tags:
+        - { Key: Name, Value: !Sub "${Id}-nlb" }
+
+  # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-elasticloadbalancingv2-targetgroup.html
+  NLBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: CreateNlb
+    Properties:
+      # Target group name '...' cannot be longer than '32' characters
+      Name: !Join ["-", [!Ref Id, "tg"]]
+      # Health check enabled must be true for target groups
+      # with target type 'instance'
+      HealthCheckEnabled: true
+      HealthCheckProtocol: TCP
+      Protocol: TCP
+      TargetType: instance
+      VpcId: !Ref NlbVpcId
+      Port: !Ref NlbHttpPort
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: 60
+
+  # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-elasticloadbalancingv2-listener.html
+  NLBListenerTcp:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: CreateNlb
+    Properties:
+      LoadBalancerArn: !Ref NLB
+      Port: !Ref NlbHttpPort
+      Protocol: TCP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref NLBTargetGroup
+
+  # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-elasticloadbalancingv2-listener.html
+  # NOTE: only needs be created once for either anchor or non-anchor node ASG since it's linked
+  # to a target group and the NLB that are both linked to the ASGs
+  NLBListenerHttps:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasNlbAcmCertificateArn
+    Properties:
+      LoadBalancerArn: !Ref NLB
+      Port: 443
+      # NLB can't use HTTPS (only ALB can use HTTPS)!
+      # supports "HTTPS" https://aws.amazon.com/premiumsupport/knowledge-center/associate-acm-certificate-alb-nlb/
+      Protocol: TLS
+      # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-elasticloadbalancingv2-listener-action.html#cfn-elasticloadbalancingv2-listener-action-type
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref NLBTargetGroup
+      # supports "HTTPS" https://aws.amazon.com/premiumsupport/knowledge-center/associate-acm-certificate-alb-nlb/
+      # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-elasticloadbalancingv2-listener-certificate.html
+      Certificates:
+        - { CertificateArn: !Ref NlbAcmCertificateArn }
+
+  # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-ec2-launchtemplate-launchtemplatedata.html
+  ASGLaunchTemplate:
+    Condition: CreateAsgLaunchTemplate
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Join ["-", [!Ref Id, !Ref ArchType]]
+      LaunchTemplateData:
+        # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-ec2-launchtemplate-launchtemplatedata-iaminstanceprofile.html
+        IamInstanceProfile:
+          Arn: !Ref InstanceProfileArn
+        ImageId:
+          Fn::If:
+            - HasImageId
+            - !Ref ImageId
+            - !Ref ImageIdSsmParameter
+        KeyName: !Ref Ec2KeyPairName
+
+        # https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/device_naming.html
+        # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-ec2-launchtemplate-blockdevicemapping.html
+        # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-ec2-launchtemplate-blockdevicemapping-ebs.html#cfn-ec2-launchtemplate-blockdevicemapping-ebs-volumesize
+        # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-ec2-launchtemplate-blockdevicemapping-ebs.html
+        # https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/RootDeviceStorage.html
+        BlockDeviceMappings:
+          # mounted to "/dev/root"
+          - DeviceName: "/dev/sda1"
+            Ebs:
+              VolumeType: gp3
+              VolumeSize: 40
+
+        Monitoring:
+          Enabled: true
+
+        # need this for public DNS + SSH access
+        NetworkInterfaces:
+          - AssociatePublicIpAddress: true
+            DeleteOnTermination: true
+            DeviceIndex: 0
+            Groups:
+              - !Ref SecurityGroupId
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: Name, Value: !Sub "${Id}-${ArchType}" }
+
+        # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-ec2-launchtemplate-launchtemplatedata.html#cfn-ec2-launchtemplate-launchtemplatedata-userdata
+        # https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/QuickStartEC2Instance.html
+        # /var/log/cloud-init-output.log
+        # takes about 3-minute
+        UserData:
+          Fn::Base64:
+            Fn::Sub: |
+              #!/bin/bash
+              set -xeu
+
+              export DEBIAN_FRONTEND=noninteractive
+
+              while [ 1 ]; do
+                sudo apt-get update -yqq && sudo apt-get upgrade -yqq \
+                && sudo apt-get install -yq \
+                curl wget unzip zip gzip tar libssl-dev \
+                python3-pip python-setuptools zsh
+                if [ $? = 0 ]; then break; fi; # check return value, break if successful (0)
+                sleep 2s;
+              done;
+
+              # http://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/intrinsic-function-reference-sub.html
+              # "x86_64" (mac, linux x86), "arm64" (M1), "aarch64" (graviton)
+              # https://aws.amazon.com/blogs/developer/aws-cli-v2-now-available-for-linux-arm/
+              export LINUX_ARCH_TYPE=$(uname -m)
+              echo LINUX_ARCH_TYPE: ${!LINUX_ARCH_TYPE}
+
+              while [ 1 ]; do
+                sudo rm -f ./awscli-exe-linux-${!LINUX_ARCH_TYPE}.zip || true;
+                wget --quiet --retry-connrefused --waitretry=1 --read-timeout=20 --timeout=15 --tries=70 --continue https://awscli.amazonaws.com/awscli-exe-linux-${!LINUX_ARCH_TYPE}.zip
+                if [ $? = 0 ]; then break; fi; # check return value, break if successful (0)
+                sleep 2s;
+              done;
+              unzip ./awscli-exe-linux-${!LINUX_ARCH_TYPE}.zip
+              sudo ./aws/install
+              /usr/local/bin/aws --version
+
+              # https://docs.aws.amazon.com/systems-manager/latest/userguide/agent-install-ubuntu.html
+              sudo snap install amazon-ssm-agent --classic
+              sudo systemctl enable snap.amazon-ssm-agent.amazon-ssm-agent.service
+              sudo systemctl restart snap.amazon-ssm-agent.amazon-ssm-agent.service
+              mkdir -p /etc/systemd/system/snap.amazon-ssm-agent.amazon-ssm-agent.service.d
+              cat > /tmp/amazon-ssm-agent-10-restart-always.conf <<EOF
+              [Service]
+              Restart=always
+              RestartSec=60s
+              EOF
+              sudo mv /tmp/amazon-ssm-agent-10-restart-always.conf /etc/systemd/system/snap.amazon-ssm-agent.amazon-ssm-agent.service.d/10-restart-always.conf
+              sudo systemctl start --no-block snap.amazon-ssm-agent.amazon-ssm-agent.service
+
+              # https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/QuickStartEC2Instance.html
+              mkdir -p /tmp/install-cloudwatch-logs
+              while [ 1 ]; do
+                pushd /tmp/install-cloudwatch-logs
+                sudo rm -f ./amazon-cloudwatch-agent.deb || true;
+                wget --quiet --retry-connrefused --waitretry=1 --read-timeout=20 --timeout=15 --tries=70 --continue https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/${ArchType}/latest/amazon-cloudwatch-agent.deb
+                popd
+                if [ $? = 0 ]; then break; fi; # check return value, break if successful (0)
+                sleep 2s;
+              done;
+              while [ 1 ]; do
+                echo "installing amazon-cloudwatch-agent"
+                pushd /tmp/install-cloudwatch-logs && sudo dpkg -i -E ./amazon-cloudwatch-agent.deb && popd
+                if [ $? = 0 ]; then break; fi; # check return value, break if successful (0)
+                sleep 2s;
+              done;
+
+              # TODO: support arm64 ubuntu, "aarch64-ubuntu20.04" (graviton)
+              # "aarch64-unknown-linux-gnu" may not work without cross-linker for linux
+              # https://users.rust-lang.org/t/cant-cross-compile-project-with-openssl/70922
+              if [[ ${AvalanchedDownloadSource} == "github" ]]; then
+                sudo rm -f ./avalanched-aws.${!LINUX_ARCH_TYPE}-${RustOsType}-linux-gnu
+                sudo rm -f /tmp/avalanched
+                sudo rm -f /usr/local/bin/avalanched
+                while [ 1 ]; do
+                  sudo rm -f ./avalanched-aws.${!LINUX_ARCH_TYPE}-${RustOsType}-linux-gnu || true;
+                  wget --quiet --retry-connrefused --waitretry=1 --read-timeout=20 --timeout=15 --tries=70 --continue https://github.com/ava-labs/avalanche-ops/releases/download/latest/avalanched-aws.${!LINUX_ARCH_TYPE}-${RustOsType}-linux-gnu
+                  if [ $? = 0 ]; then break; fi; # check return value, break if successful (0)
+                  sleep 2s;
+                done;
+                mv ./avalanched-aws.${!LINUX_ARCH_TYPE}-${RustOsType}-linux-gnu /tmp/avalanched
+                chmod +x /tmp/avalanched
+                sudo mv /tmp/avalanched /usr/local/bin/avalanched
+              else
+                sudo rm -f /tmp/avalanched
+                AWS_RETRY_MODE=standard AWS_MAX_ATTEMPTS=7 aws s3 cp s3://${S3BucketName}/${Id}/bootstrap/install/avalanched /tmp/avalanched
+                chmod +x /tmp/avalanched
+                sudo mv /tmp/avalanched /usr/local/bin/avalanched
+              fi;
+              /usr/local/bin/avalanched --version
+
+              /usr/local/bin/avalanched install \
+              --region ${AWS::Region} \
+              --s3-bucket ${S3BucketName} \
+              --avalanchego-s3-key ${Id}/bootstrap/install/avalanchego \
+              --avalanchego-target-file-path /usr/local/bin/avalanchego \
+              --avalanchego-plugin-s3-prefix ${Id}/bootstrap/install/plugin \
+              --avalanchego-plugin-target-dir /usr/local/bin/plugin \
+              --rust-os-type ${RustOsType} \
+              --avalanche-config-s3-key ${Id}/bootstrap/install/avalanche-config \
+              --avalanche-config-target-file-path /usr/local/bin/avalanche-config \
+              --aws-volume-provisioner-s3-key ${Id}/bootstrap/install/aws-volume-provisioner \
+              --aws-volume-provisioner-target-file-path /usr/local/bin/aws-volume-provisioner \
+              --aws-ip-provisioner-s3-key ${Id}/bootstrap/install/aws-ip-provisioner \
+              --aws-ip-provisioner-target-file-path /usr/local/bin/aws-ip-provisioner \
+              --avalanche-telemetry-cloudwatch-s3-key ${Id}/bootstrap/install/avalanche-telemetry-cloudwatch \
+              --avalanche-telemetry-cloudwatch-target-file-path /usr/local/bin/avalanche-telemetry-cloudwatch
+
+              /usr/local/bin/avalanched --version
+              /usr/local/bin/avalanchego --version
+              ls /usr/local/bin/plugin || true
+              /usr/local/bin/avalanche-config --version
+              /usr/local/bin/aws-volume-provisioner --version
+              /usr/local/bin/aws-ip-provisioner --version
+              /usr/local/bin/avalanche-telemetry-cloudwatch --version
+
+              echo "Running /usr/local/bin/aws-volume-provisioner..."
+              # --initial-wait-random-seconds=X to prevent EBS volume provision contentions
+              /usr/local/bin/aws-volume-provisioner \
+              --log-level=info \
+              --initial-wait-random-seconds=${VolumeProvisionerInitialWaitRandomSeconds} \
+              --id-tag-key=Id \
+              --id-tag-value=${Id} \
+              --kind-tag-key=Kind \
+              --kind-tag-value=aws-volume-provisioner \
+              --ec2-tag-asg-name-key=ASG_NAME \
+              --asg-tag-key=autoscaling:groupName \
+              --volume-type=${VolumeType} \
+              --volume-size=${VolumeSize} \
+              --volume-iops=${VolumeIops} \
+              --volume-throughput=${VolumeThroughput} \
+              --ebs-device-name=/dev/xvdb \
+              --block-device-name=/dev/nvme1n1 \
+              --filesystem-name=ext4 \
+              --mount-directory-path=/data
+
+              if [[ ${IpMode} == "elastic" ]]; then
+                echo "Running /usr/local/bin/aws-ip-provisioner..."
+                /usr/local/bin/aws-ip-provisioner \
+                --log-level=info \
+                --id-tag-key=Id \
+                --id-tag-value=${Id} \
+                --kind-tag-key=Kind \
+                --kind-tag-value=aws-ip-provisioner \
+                --ec2-tag-asg-name-key=ASG_NAME \
+                --asg-tag-key=autoscaling:groupName \
+                --mounted-eip-file-path=/data/eip.yaml
+              else
+                echo "skipping allocating elastic IP address..."
+              fi;
+
+              # for logs
+              mkdir -p /var/log/avalanche
+              chmod 755 /var/log/avalanche
+
+              cat > /tmp/avalanched.service <<EOF
+              [Unit]
+              Description=Avalanched (avalanche agent)
+
+              [Service]
+              Type=exec
+              TimeoutStartSec=300
+              Restart=on-failure
+              RestartSec=5s
+              LimitNOFILE=40000
+              ExecStart=/usr/local/bin/avalanched ${AvalanchedFlag}
+              StandardOutput=append:/var/log/avalanched.log
+              StandardError=append:/var/log/avalanched.log
+
+              [Install]
+              WantedBy=multi-user.target
+              EOF
+              sudo mv /tmp/avalanched.service /etc/systemd/system/avalanched.service
+              sudo systemctl daemon-reload
+              sudo systemctl enable avalanched.service
+              sudo systemctl start --no-block avalanched.service
+
+              # enough time for "avalanched" to initialize cloudwatch configuration
+              sleep 10
+              echo "wait until /opt/aws/amazon-cloudwatch-agent/bin/config.json is written by avalanched"
+              while [[ ! -s /opt/aws/amazon-cloudwatch-agent/bin/config.json ]]
+                do
+                echo "waiting for /opt/aws/amazon-cloudwatch-agent/bin/config.json creation"
+                sleep 5
+              done
+
+              cat /opt/aws/amazon-cloudwatch-agent/bin/config.json
+              /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/bin/config.json -s
+              mkdir -p /etc/systemd/system/amazon-cloudwatch-agent.service.d
+              cat <<EOF > /tmp/amazon-cloudwatch-agent-10-restart-always.conf
+              [Service]
+              Restart=always
+              RestartSec=60s
+              EOF
+              sudo mv /tmp/amazon-cloudwatch-agent-10-restart-always.conf /etc/systemd/system/amazon-cloudwatch-agent.service.d/10-restart-always.conf
+
+              sudo timedatectl set-ntp on
+
+              # e.g.,
+              # "Accept error: accept tcp [::]:9650: accept4: too many open files; retrying in 1s"
+              sudo echo "* hard nofile 1000000" >> /etc/security/limits.conf
+              sudo echo "* soft nofile 1000000" >> /etc/security/limits.conf
+              sudo sysctl -w fs.file-max=1000000
+              sudo sysctl -p
+
+  # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-as-group.html
+  ASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: !Ref AsgMinInstancesInService
+        MaxBatchSize: 1
+        SuspendProcesses:
+          - HealthCheck
+          - ReplaceUnhealthy
+          - AZRebalance
+          - AlarmNotification
+          - ScheduledActions
+    Properties:
+      # AutoScalingGroupName: !Join ["-", [!Ref Id, !Ref NodeKind, !Ref ArchType]]
+      AutoScalingGroupName: !Ref AsgName
+      MinSize: !Ref AsgMinSize
+      MaxSize: !Ref AsgMaxSize
+      DesiredCapacity: !Ref AsgDesiredCapacity
+      VPCZoneIdentifier: !Ref PublicSubnetIds
+      TargetGroupARNs:
+        - Fn::If:
+            - CreateNlb
+            - !Ref NLBTargetGroup
+            - Fn::If:
+                - NlbEnabledTrue
+                - !Ref NlbTargetGroupArn
+                - !Ref AWS::NoValue
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 120
+      # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-as-metricscollection.html
+      MetricsCollection:
+        - Granularity: "1Minute"
+      Tags:
+        # we can either propagate these information
+        # via tags, avalanched CLI flags, avalanche-ops spec, etc.
+        # use tags for relatively static configurations
+        # because when tags are updated, instances need be refreshed
+        - Key: Name
+          Value: !Ref AsgName
+          PropagateAtLaunch: true
+        - Key: ASG_NAME
+          Value: !Ref AsgName
+          PropagateAtLaunch: true
+        - Key: ID
+          Value: !Ref Id
+          PropagateAtLaunch: true
+        - Key: NETWORK_ID
+          Value: !Ref NetworkId
+          PropagateAtLaunch: true
+        - Key: ARCH_TYPE
+          Value: !Ref ArchType
+          PropagateAtLaunch: true
+        - Key: RUST_OS_TYPE
+          Value: !Ref RustOsType
+          PropagateAtLaunch: true
+        - Key: INSTANCE_MODE
+          Value: !Ref InstanceMode
+          PropagateAtLaunch: true
+        - Key: NODE_KIND
+          Value: !Ref NodeKind
+          PropagateAtLaunch: true
+        - Key: KMS_CMK_ARN
+          Value: !Ref KmsCmkArn
+          PropagateAtLaunch: true
+        - Key: AAD_TAG
+          Value: !Ref AadTag
+          PropagateAtLaunch: true
+        - Key: S3_BUCKET_NAME
+          Value: !Ref S3BucketName
+          PropagateAtLaunch: true
+        - Key: CLOUDWATCH_CONFIG_FILE_PATH
+          Value: /opt/aws/amazon-cloudwatch-agent/bin/config.json
+          PropagateAtLaunch: true
+        - Key: AVALANCHE_TELEMETRY_CLOUDWATCH_RULES_FILE_PATH
+          Value: /data/avalanche-telemetry-cloudwatch.rules.yaml
+          PropagateAtLaunch: true
+        - Key: AVALANCHEUP_SPEC_PATH
+          Value: /data/avalancheup.yaml
+          PropagateAtLaunch: true
+        - Key: AVALANCHE_DATA_VOLUME_PATH
+          Value: /data
+          PropagateAtLaunch: true
+        - Key: AVALANCHE_DATA_VOLUME_EBS_DEVICE_NAME
+          Value: /dev/xvdb
+          PropagateAtLaunch: true
+        - Key: EIP_FILE_PATH
+          Value: /data/eip.yaml
+          PropagateAtLaunch: true
+
+      # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-autoscaling-autoscalinggroup-mixedinstancespolicy.html
+      # https://aws.amazon.com/getting-started/hands-on/ec2-auto-scaling-spot-instances/
+      MixedInstancesPolicy:
+        # define balance between spot vs. on-demand
+        # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-autoscaling-autoscalinggroup-instancesdistribution.html
+        # https://ec2spotworkshops.com/launching_ec2_spot_instances/asg.html
+        InstancesDistribution:
+          OnDemandAllocationStrategy: "lowest-price"
+          # minimum amount of the Auto Scaling group's capacity that must be fulfilled by On-Demand Instances
+          OnDemandBaseCapacity: 0
+          # percentages of On-Demand Instances and Spot Instances for your additional capacity beyond OnDemandBaseCapacity
+          # 20 specifies 20% On-Demand Instances, 80% Spot Instances
+          # If set to 0, only Spot Instances are used.
+          # If set to 100, only On-Demand Instances are used.
+          OnDemandPercentageAboveBaseCapacity: !Ref OnDemandPercentageAboveBaseCapacity
+          SpotAllocationStrategy: "lowest-price"
+          # number of Spot Instance pools across which to allocate your Spot Instances
+          SpotInstancePools: 3
+        # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-autoscaling-autoscalinggroup-launchtemplate.html
+        LaunchTemplate:
+          LaunchTemplateSpecification:
+            LaunchTemplateId:
+              Fn::If:
+                - CreateAsgLaunchTemplate
+                - !Ref ASGLaunchTemplate
+                - !Ref AsgLaunchTemplateId
+            Version:
+              Fn::If:
+                - CreateAsgLaunchTemplate
+                - !GetAtt ASGLaunchTemplate.LatestVersionNumber
+                - !Ref AsgLaunchTemplateVersion
+
+          # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-autoscaling-autoscalinggroup-launchtemplateoverrides.html
+          Overrides:
+            - InstanceType: !Select [0, !Ref InstanceTypes]
+            - Fn::If:
+                - Has2InstanceTypes
+                - InstanceType: !Select [1, !Ref InstanceTypes]
+                - !Ref AWS::NoValue
+            - Fn::If:
+                - Has3InstanceTypes
+                - InstanceType: !Select [2, !Ref InstanceTypes]
+                - !Ref AWS::NoValue
+            - Fn::If:
+                - Has4InstanceTypes
+                - InstanceType: !Select [3, !Ref InstanceTypes]
+                - !Ref AWS::NoValue
+            - Fn::If:
+                - Has5InstanceTypes
+                - InstanceType: !Select [4, !Ref InstanceTypes]
+                - !Ref AWS::NoValue
+            - Fn::If:
+                - Has6InstanceTypes
+                - InstanceType: !Select [5, !Ref InstanceTypes]
+                - !Ref AWS::NoValue
+            - Fn::If:
+                - Has7InstanceTypes
+                - InstanceType: !Select [6, !Ref InstanceTypes]
+                - !Ref AWS::NoValue
+            - Fn::If:
+                - Has8InstanceTypes
+                - InstanceType: !Select [7, !Ref InstanceTypes]
+                - !Ref AWS::NoValue
+            - Fn::If:
+                - Has9InstanceTypes
+                - InstanceType: !Select [8, !Ref InstanceTypes]
+                - !Ref AWS::NoValue
+            - Fn::If:
+                - Has10InstanceTypes
+                - InstanceType: !Select [9, !Ref InstanceTypes]
+                - !Ref AWS::NoValue
+
+Outputs:
+  # same as "AutoScalingGroupName"
+  AsgLogicalId:
+    Value: !Ref ASG
+
+  NlbArn:
+    Condition: CreateNlb
+    Value: !Ref NLB
+
+  NlbTargetGroupArn:
+    Condition: CreateNlb
+    Value: !Ref NLBTargetGroup
+
+  NlbDnsName:
+    Condition: CreateNlb
+    Value: !GetAtt NLB.DNSName
+
+  AsgLaunchTemplateId:
+    Condition: CreateAsgLaunchTemplate
+    Value: !Ref ASGLaunchTemplate
+
+  AsgLaunchTemplateVersion:
+    Condition: CreateAsgLaunchTemplate
+    Value: !GetAtt ASGLaunchTemplate.LatestVersionNumber

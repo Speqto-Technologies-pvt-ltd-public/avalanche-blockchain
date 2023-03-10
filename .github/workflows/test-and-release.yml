@@ -1,0 +1,320 @@
+name: Test and release
+
+# ref. https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "*"
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  static_analysis:
+    name: Static analysis (lint)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: nightly
+          profile: minimal
+          components: rustfmt, clippy
+          override: true
+
+      - name: Check Rust version
+        run: rustc --version
+
+      - uses: Swatinem/rust-cache@v1
+        with:
+          cache-on-failure: true
+
+      - name: Run static analysis tests
+        shell: bash
+        run: scripts/tests.lint.sh
+
+  check_cargo_unused:
+    name: Check Cargo unused
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: nightly
+          profile: minimal
+          components: rustfmt, clippy
+          override: true
+
+      - name: Check Rust version
+        run: rustc --version
+
+      - uses: Swatinem/rust-cache@v1
+        with:
+          cache-on-failure: true
+
+      - name: Check unused Cargo dependencies
+        shell: bash
+        run: scripts/tests.unused.sh
+
+  unit_tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+
+      - name: Check Rust version
+        run: rustc --version
+
+      - uses: Swatinem/rust-cache@v1
+        with:
+          cache-on-failure: true
+
+      - name: Run unit tests
+        run: scripts/tests.unit.sh
+
+  release:
+    name: Release ${{ matrix.job.target }} (${{ matrix.job.os }})
+    runs-on: ${{ matrix.job.os }}
+    needs: [static_analysis, check_cargo_unused, unit_tests]
+    strategy:
+      matrix:
+        job:
+          # use the same OS version as EC2/cloud host
+          # otherwise, it can fail with:
+          # error while loading shared libraries: libssl.so.3: cannot open shared object file: No such file or directory
+          # ref. https://github.com/sfackler/rust-openssl/issues/1748
+          # ref. https://doc.rust-lang.org/nightly/rustc/platform-support.html
+          - os: ubuntu-20.04
+            platform: linux
+            target: x86_64-unknown-linux-gnu
+
+          # use the same OS version as CloudFormation template ImageId
+          # https://github.com/sharkdp/fd/blob/master/.github/workflows/CICD.yml
+          #
+          # may require manual builds without cross-linker for linux
+          # https://users.rust-lang.org/t/cant-cross-compile-project-with-openssl/70922
+          - os: ubuntu-20.04
+            platform: linux
+            target: aarch64-unknown-linux-gnu
+            use-cross: true
+
+          - os: macos-latest
+            platform: darwin
+            target: x86_64-apple-darwin
+
+          - os: macos-latest
+            platform: darwin
+            target: aarch64-apple-darwin
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      # https://github.com/sharkdp/fd/blob/master/.github/workflows/CICD.yml
+      # https://github.com/cross-rs/cross/wiki/Recipes#openssl
+      - name: Install OS dependencies
+        shell: bash
+        run: |
+          case ${{ matrix.job.target }} in
+            arm-unknown-linux-*) sudo apt-get -y update ; sudo apt-get -y install gcc-arm-linux-gnueabihf ;;
+            aarch64-unknown-linux-gnu) sudo apt-get -y update ; sudo apt-get -y install gcc-aarch64-linux-gnu ;;
+          esac
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          target: ${{ matrix.job.target }}
+          override: true
+
+      - name: Show version information (Rust, cargo, GCC)
+        shell: bash
+        run: |
+          gcc --version || true
+          rustup -V
+          rustup toolchain list
+          rustup default
+          cargo -V
+          rustc -V
+
+      - name: Set cargo cmd
+        shell: bash
+        run: echo "CARGO_CMD=cargo" >> $GITHUB_ENV
+
+      - name: Set cargo cmd to cross
+        shell: bash
+        if: ${{ matrix.job.use-cross == true }}
+        run: echo "CARGO_CMD=cross" >> $GITHUB_ENV
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.job.os }}-${{ matrix.job.target }}
+
+      - name: Install cross
+        if: ${{ matrix.job.use-cross == true }}
+        run: cargo install cross --locked
+
+      - name: Build
+        run: ${{ env.CARGO_CMD }} build --release --target=${{ matrix.job.target }} --bin avalanche-config --bin avalanche-kms --bin avalanched-aws --bin avalancheup-aws --bin blizzard-aws --bin blizzardup-aws --bin staking-key-cert-s3-downloader
+
+      - name: Compress binaries
+        id: release_artifacts
+        env:
+          PLATFORM_NAME: ${{ matrix.job.platform }}
+          TARGET: ${{ matrix.job.target }}
+        shell: bash
+        run: |
+          if [ "$PLATFORM_NAME" == "linux" ]; then
+
+            cp ./target/${TARGET}/release/avalanche-config avalanche-config.${TARGET}
+            echo "file_name_avalanche_config=avalanche-config.${TARGET}" >> $GITHUB_OUTPUT
+            tar -czvf avalanche-config.${TARGET}.tar.gz -C ./target/${TARGET}/release avalanche-config
+            echo "file_name_avalanche_config_tar_gz=avalanche-config.${TARGET}.tar.gz" >> $GITHUB_OUTPUT
+
+            cp ./target/${TARGET}/release/avalanche-kms avalanche-kms.${TARGET}
+            echo "file_name_avalanche_kms=avalanche-kms.${TARGET}" >> $GITHUB_OUTPUT
+            tar -czvf avalanche-kms.${TARGET}.tar.gz -C ./target/${TARGET}/release avalanche-kms
+            echo "file_name_avalanche_kms_tar_gz=avalanche-kms.${TARGET}.tar.gz" >> $GITHUB_OUTPUT
+
+            cp ./target/${TARGET}/release/avalanched-aws avalanched-aws.${TARGET}
+            echo "file_name_avalanched_aws=avalanched-aws.${TARGET}" >> $GITHUB_OUTPUT
+            tar -czvf avalanched-aws.${TARGET}.tar.gz -C ./target/${TARGET}/release avalanched-aws
+            echo "file_name_avalanched_aws_tar_gz=avalanched-aws.${TARGET}.tar.gz" >> $GITHUB_OUTPUT
+
+            cp ./target/${TARGET}/release/avalancheup-aws avalancheup-aws.${TARGET}
+            echo "file_name_avalancheup_aws=avalancheup-aws.${TARGET}" >> $GITHUB_OUTPUT
+            tar -czvf avalancheup-aws.${TARGET}.tar.gz -C ./target/${TARGET}/release avalancheup-aws
+            echo "file_name_avalancheup_aws_tar_gz=avalancheup-aws.${TARGET}.tar.gz" >> $GITHUB_OUTPUT
+
+            cp ./target/${TARGET}/release/blizzard-aws blizzard-aws.${TARGET}
+            echo "file_name_blizzard_aws=blizzard-aws.${TARGET}" >> $GITHUB_OUTPUT
+            tar -czvf blizzard-aws.${TARGET}.tar.gz -C ./target/${TARGET}/release blizzard-aws
+            echo "file_name_blizzard_aws_tar_gz=blizzard-aws.${TARGET}.tar.gz" >> $GITHUB_OUTPUT
+
+            cp ./target/${TARGET}/release/blizzardup-aws blizzardup-aws.${TARGET}
+            echo "file_name_blizzardup_aws=blizzardup-aws.${TARGET}" >> $GITHUB_OUTPUT
+            tar -czvf blizzardup-aws.${TARGET}.tar.gz -C ./target/${TARGET}/release blizzardup-aws
+            echo "file_name_blizzardup_aws_tar_gz=blizzardup-aws.${TARGET}.tar.gz" >> $GITHUB_OUTPUT
+
+            cp ./target/${TARGET}/release/staking-key-cert-s3-downloader staking-key-cert-s3-downloader.${TARGET}
+            echo "file_name_staking_key_cert_s3_downloader=staking-key-cert-s3-downloader.${TARGET}" >> $GITHUB_OUTPUT
+            tar -czvf staking-key-cert-s3-downloader.${TARGET}.tar.gz -C ./target/${TARGET}/release staking-key-cert-s3-downloader
+            echo "file_name_staking_key_cert_s3_downloader_tar_gz=staking-key-cert-s3-downloader.${TARGET}.tar.gz" >> $GITHUB_OUTPUT
+
+          elif [ "$PLATFORM_NAME" == "darwin" ]; then
+
+            cp ./target/${TARGET}/release/avalanche-config avalanche-config.${TARGET}
+            echo "file_name_avalanche_config=avalanche-config.${TARGET}" >> $GITHUB_OUTPUT
+            gtar -czvf avalanche-config.${TARGET}.tar.gz -C ./target/${TARGET}/release avalanche-config
+            echo "file_name_avalanche_config_tar_gz=avalanche-config.${TARGET}.tar.gz" >> $GITHUB_OUTPUT
+
+            cp ./target/${TARGET}/release/avalanche-kms avalanche-kms.${TARGET}
+            echo "file_name_avalanche_kms=avalanche-kms.${TARGET}" >> $GITHUB_OUTPUT
+            gtar -czvf avalanche-kms.${TARGET}.tar.gz -C ./target/${TARGET}/release avalanche-kms
+            echo "file_name_avalanche_kms_tar_gz=avalanche-kms.${TARGET}.tar.gz" >> $GITHUB_OUTPUT
+
+            cp ./target/${TARGET}/release/avalanched-aws avalanched-aws.${TARGET}
+            echo "file_name_avalanched_aws=avalanched-aws.${TARGET}" >> $GITHUB_OUTPUT
+            gtar -czvf avalanched-aws.${TARGET}.tar.gz -C ./target/${TARGET}/release avalanched-aws
+            echo "file_name_avalanched_aws_tar_gz=avalanched-aws.${TARGET}.tar.gz" >> $GITHUB_OUTPUT
+
+            cp ./target/${TARGET}/release/avalancheup-aws avalancheup-aws.${TARGET}
+            echo "file_name_avalancheup_aws=avalancheup-aws.${TARGET}" >> $GITHUB_OUTPUT
+            gtar -czvf avalancheup-aws.${TARGET}.tar.gz -C ./target/${TARGET}/release avalancheup-aws
+            echo "file_name_avalancheup_aws_tar_gz=avalancheup-aws.${TARGET}.tar.gz" >> $GITHUB_OUTPUT
+
+            cp ./target/${TARGET}/release/blizzard-aws blizzard-aws.${TARGET}
+            echo "file_name_blizzard_aws=blizzard-aws.${TARGET}" >> $GITHUB_OUTPUT
+            gtar -czvf blizzard-aws.${TARGET}.tar.gz -C ./target/${TARGET}/release blizzard-aws
+            echo "file_name_blizzard_aws_tar_gz=blizzard-aws.${TARGET}.tar.gz" >> $GITHUB_OUTPUT
+
+            cp ./target/${TARGET}/release/blizzardup-aws blizzardup-aws.${TARGET}
+            echo "file_name_blizzardup_aws=blizzardup-aws.${TARGET}" >> $GITHUB_OUTPUT
+            gtar -czvf blizzardup-aws.${TARGET}.tar.gz -C ./target/${TARGET}/release blizzardup-aws
+            echo "file_name_blizzardup_aws_tar_gz=blizzardup-aws.${TARGET}.tar.gz" >> $GITHUB_OUTPUT
+
+            cp ./target/${TARGET}/release/staking-key-cert-s3-downloader staking-key-cert-s3-downloader.${TARGET}
+            echo "file_name_staking_key_cert_s3_downloader=staking-key-cert-s3-downloader.${TARGET}" >> $GITHUB_OUTPUT
+            gtar -czvf staking-key-cert-s3-downloader.${TARGET}.tar.gz -C ./target/${TARGET}/release staking-key-cert-s3-downloader
+            echo "file_name_staking_key_cert_s3_downloader_tar_gz=staking-key-cert-s3-downloader.${TARGET}.tar.gz" >> $GITHUB_OUTPUT
+
+          else
+
+            echo "skipping $PLATFORM_NAME"
+
+          fi
+
+      # release tip from latest commits
+      # https://github.com/softprops/action-gh-release
+      # https://docs.github.com/en/actions/learn-github-actions/contexts#github-context
+      - name: Release latest
+        uses: softprops/action-gh-release@v1
+        if: ${{ github.ref == 'refs/heads/main' }}
+        with:
+          name: Latest release
+          tag_name: latest
+          draft: false
+          prerelease: false
+          body: Latest builds from the last commit.
+          files: |
+            ${{ steps.release_artifacts.outputs.file_name_avalanche_config }}
+            ${{ steps.release_artifacts.outputs.file_name_avalanche_config_tar_gz }}
+            ${{ steps.release_artifacts.outputs.file_name_avalanche_kms }}
+            ${{ steps.release_artifacts.outputs.file_name_avalanche_kms_tar_gz }}
+            ${{ steps.release_artifacts.outputs.file_name_avalanched_aws }}
+            ${{ steps.release_artifacts.outputs.file_name_avalanched_aws_tar_gz }}
+            ${{ steps.release_artifacts.outputs.file_name_avalancheup_aws }}
+            ${{ steps.release_artifacts.outputs.file_name_avalancheup_aws_tar_gz }}
+            ${{ steps.release_artifacts.outputs.file_name_blizzard_aws }}
+            ${{ steps.release_artifacts.outputs.file_name_blizzard_aws_tar_gz }}
+            ${{ steps.release_artifacts.outputs.file_name_blizzardup_aws }}
+            ${{ steps.release_artifacts.outputs.file_name_blizzardup_aws_tar_gz }}
+            ${{ steps.release_artifacts.outputs.file_name_staking_key_cert_s3_downloader }}
+            ${{ steps.release_artifacts.outputs.file_name_staking_key_cert_s3_downloader_tar_gz }}
+
+      # release only for tags
+      # https://github.com/softprops/action-gh-release
+      # https://docs.github.com/en/actions/learn-github-actions/contexts#github-context
+      - name: Release tag
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          name: ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          body: Release builds for ${{ github.ref_name }}.
+          files: |
+            ${{ steps.release_artifacts.outputs.file_name_avalanche_config }}
+            ${{ steps.release_artifacts.outputs.file_name_avalanche_config_tar_gz }}
+            ${{ steps.release_artifacts.outputs.file_name_avalanche_kms }}
+            ${{ steps.release_artifacts.outputs.file_name_avalanche_kms_tar_gz }}
+            ${{ steps.release_artifacts.outputs.file_name_avalanched_aws }}
+            ${{ steps.release_artifacts.outputs.file_name_avalanched_aws_tar_gz }}
+            ${{ steps.release_artifacts.outputs.file_name_avalancheup_aws }}
+            ${{ steps.release_artifacts.outputs.file_name_avalancheup_aws_tar_gz }}
+            ${{ steps.release_artifacts.outputs.file_name_blizzard_aws }}
+            ${{ steps.release_artifacts.outputs.file_name_blizzard_aws_tar_gz }}
+            ${{ steps.release_artifacts.outputs.file_name_blizzardup_aws }}
+            ${{ steps.release_artifacts.outputs.file_name_blizzardup_aws_tar_gz }}
+            ${{ steps.release_artifacts.outputs.file_name_staking_key_cert_s3_downloader }}
+            ${{ steps.release_artifacts.outputs.file_name_staking_key_cert_s3_downloader_tar_gz }}

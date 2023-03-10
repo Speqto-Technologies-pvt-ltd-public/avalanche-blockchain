@@ -1,0 +1,34 @@
+[package]
+name = "avalanched-aws"
+version = "0.3.0-beta.0" # https://github.com/ava-labs/avalanche-ops/releases
+edition = "2021"
+rust-version = "1.67"
+
+[[bin]]
+name = "avalanched-aws"
+path = "src/main.rs"
+
+[dependencies]
+avalanche-config-installer = { path = "../avalanche-config-installer" }
+avalanche-installer = "0.0.47" # https://crates.io/crates/avalanche-installer
+avalanche-ops = { path = "../avalanche-ops" }
+avalanche-telemetry-cloudwatch-installer = "0.0.67" # https://crates.io/crates/avalanche-telemetry-cloudwatch
+avalanche-types = { version = "0.0.281", features = ["avalanchego", "jsonrpc_client", "subnet_evm"] } # https://crates.io/crates/avalanche-types
+aws-ip-provisioner-installer = "0.0.48" # https://crates.io/crates/aws-ip-provisioner-installer
+aws-manager = { version = "0.24.24", features = ["autoscaling", "cloudwatch", "ec2", "s3"] } # https://github.com/gyuho/aws-manager/tags
+aws-sdk-cloudwatch = "0.24.0" # https://github.com/awslabs/aws-sdk-rust/releases
+aws-sdk-ec2 = "0.24.0" # https://github.com/awslabs/aws-sdk-rust/releases
+aws-sdk-s3 = "0.24.0" # https://github.com/awslabs/aws-sdk-rust/releases
+aws-volume-provisioner-installer = "0.0.72" # https://crates.io/crates/aws-volume-provisioner-installer
+clap = { version = "4.1.8", features = ["cargo", "derive"] } # https://github.com/clap-rs/clap/releases
+command-manager = "0.0.1"
+compress-manager = "0.0.6"
+env_logger = "0.10.0"
+log = "0.4.17"
+prometheus-manager = "0.0.23"
+random-manager = "0.0.5"
+tempfile = "3.4.0"
+tokio = { version = "1.26.0", features = ["full"] } # https://github.com/tokio-rs/tokio/releases
+
+# https://github.com/cross-rs/cross/wiki/Recipes#openssl
+openssl = { version = "0.10", features = ["vendored"] }

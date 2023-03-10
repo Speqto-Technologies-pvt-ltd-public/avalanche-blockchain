@@ -1,0 +1,582 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Blizzard node (amd64)"
+
+# https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/parameters-section-structure.html
+Parameters:
+  Id:
+    Type: String
+    Description: Unique identifier, prefix for all resources created below.
+
+  NodeKind:
+    Type: String
+    AllowedValues: ["worker"]
+    Description: Node kind.
+
+  S3BucketName:
+    Type: String
+    Description: S3 bucket name.
+
+  Ec2KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 SSH key name
+
+  InstanceProfileArn:
+    Type: String
+    Description: Instance profile ARN
+
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: The public subnet IDs where node instances are to be created.
+
+  SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: EC2 security group ID
+
+  ImageId:
+    Type: String
+    Default: ""
+    Description: (Optional) Custom image ID. This value overrides any AWS Systems Manager Parameter Store value specified above.
+
+  # https://ubuntu.com/server/docs/cloud-images/amazon-ec2
+  ImageIdSsmParameter:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/20.04/stable/current/amd64/hvm/ebs-gp2/ami-id
+    Description: AWS Systems Manager Parameter Store parameter of the AMI ID.
+
+  ArchType:
+    Type: String
+    AllowedValues: ["amd64", "arm64"]
+    Default: "amd64"
+    Description: The name of the architecture.
+
+  RustOsType:
+    Type: String
+    AllowedValues: ["unknown", "ubuntu20.04"]
+    Default: "unknown"
+    Description: The name of the OS distribution and kind. Used for Rust binary download links.
+
+  InstanceTypes:
+    Type: CommaDelimitedList
+    Default: c6a.xlarge,m6a.xlarge,m5.xlarge,c5.xlarge
+    Description: EC2 instance types
+
+  InstanceTypesCount:
+    Type: Number
+    Default: 4
+    MinValue: 1
+    MaxValue: 10
+    Description: The number of instance types
+
+  InstanceMode:
+    Type: String
+    AllowedValues: ["spot", "on-demand"]
+    Default: "spot"
+    Description: Set to "spot" to run spot instance.
+
+  AsgName:
+    Type: String
+    Description: Unique identifier for this Asg.
+
+  AsgMinInstancesInService:
+    Type: Number
+    Description: Minimum instances in service for update.
+    Default: 1
+    MinValue: 1
+    MaxValue: 1000
+
+  AsgMinSize:
+    Type: Number
+    Description: Minimum size auto scaling group
+    Default: 1
+    MinValue: 0
+    MaxValue: 1000
+
+  AsgMaxSize:
+    Type: Number
+    Description: Maximum size auto scaling group
+    Default: 2
+    MinValue: 1
+    MaxValue: 1000
+
+  AsgDesiredCapacity:
+    Type: Number
+    Description: Desired size auto scaling group
+    Default: 1
+    MinValue: 1
+    MaxValue: 1000
+
+  OnDemandPercentageAboveBaseCapacity:
+    Type: Number
+    Default: 100
+    MinValue: 0
+    MaxValue: 100
+    Description: 0 for Spot only. 100 for On-Demand only.
+
+  BlizzardDownloadSource:
+    Type: String
+    Default: "github"
+    Description: (Optional) set to "github" to download from github, or download from S3.
+
+Conditions:
+  HasImageId:
+    Fn::Not:
+      - Fn::Equals:
+          - Ref: ImageId
+          - ""
+
+  Has2InstanceTypes:
+    Fn::Or:
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 2
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 3
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 4
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 5
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 6
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 7
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 8
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 9
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 10
+
+  Has3InstanceTypes:
+    Fn::Or:
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 3
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 4
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 5
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 6
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 7
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 8
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 9
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 10
+
+  Has4InstanceTypes:
+    Fn::Or:
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 4
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 5
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 6
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 7
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 8
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 9
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 10
+
+  Has5InstanceTypes:
+    Fn::Or:
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 5
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 6
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 7
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 8
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 9
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 10
+
+  Has6InstanceTypes:
+    Fn::Or:
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 6
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 7
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 8
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 9
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 10
+
+  Has7InstanceTypes:
+    Fn::Or:
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 7
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 8
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 9
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 10
+
+  Has8InstanceTypes:
+    Fn::Or:
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 8
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 9
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 10
+
+  Has9InstanceTypes:
+    Fn::Or:
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 9
+      - Fn::Equals:
+          - Ref: InstanceTypesCount
+          - 10
+
+  Has10InstanceTypes:
+    Fn::Equals:
+      - Ref: InstanceTypesCount
+      - 10
+
+Resources:
+  # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-ec2-launchtemplate-launchtemplatedata.html
+  ASGLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Join ["-", [!Ref Id, !Ref NodeKind, !Ref ArchType]]
+      LaunchTemplateData:
+        # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-ec2-launchtemplate-launchtemplatedata-iaminstanceprofile.html
+        IamInstanceProfile:
+          Arn: !Ref InstanceProfileArn
+        ImageId:
+          Fn::If:
+            - HasImageId
+            - !Ref ImageId
+            - !Ref ImageIdSsmParameter
+        KeyName: !Ref Ec2KeyPairName
+
+        # https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/device_naming.html
+        # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-ec2-launchtemplate-blockdevicemapping.html
+        # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-ec2-launchtemplate-blockdevicemapping-ebs.html#cfn-ec2-launchtemplate-blockdevicemapping-ebs-volumesize
+        # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-ec2-launchtemplate-blockdevicemapping-ebs.html
+        # https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/RootDeviceStorage.html
+        BlockDeviceMappings:
+          # mounted to "/dev/root"
+          - DeviceName: "/dev/sda1"
+            Ebs:
+              VolumeType: gp3
+              VolumeSize: 8
+
+        Monitoring:
+          Enabled: true
+
+        # need this for public DNS + SSH access
+        NetworkInterfaces:
+          - AssociatePublicIpAddress: true
+            DeleteOnTermination: true
+            DeviceIndex: 0
+            Groups:
+              - !Ref SecurityGroupId
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: Name, Value: !Sub "${Id}-${NodeKind}-${ArchType}" }
+
+        # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-ec2-launchtemplate-launchtemplatedata.html#cfn-ec2-launchtemplate-launchtemplatedata-userdata
+        # https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/QuickStartEC2Instance.html
+        # /var/log/cloud-init-output.log
+        # takes about 3-minute
+        UserData:
+          Fn::Base64:
+            Fn::Sub: |
+              #!/bin/bash
+              set -xeu
+
+              export DEBIAN_FRONTEND=noninteractive
+
+              while [ 1 ]; do
+                sudo apt-get update -yqq && sudo apt-get upgrade -yqq \
+                && sudo apt-get install -yq \
+                curl wget unzip zip gzip tar libssl-dev \
+                python3-pip python-setuptools zsh
+                if [ $? = 0 ]; then break; fi; # check return value, break if successful (0)
+                sleep 2s;
+              done;
+
+              # http://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/intrinsic-function-reference-sub.html
+              export LINUX_ARCH_TYPE=$(uname -m)
+              echo LINUX_ARCH_TYPE: ${!LINUX_ARCH_TYPE}
+
+              while [ 1 ]; do
+                sudo rm -f ./awscli-exe-linux-${!LINUX_ARCH_TYPE}.zip || true;
+                wget --quiet --retry-connrefused --waitretry=1 --read-timeout=20 --timeout=15 --tries=70 --continue https://awscli.amazonaws.com/awscli-exe-linux-${!LINUX_ARCH_TYPE}.zip
+                if [ $? = 0 ]; then break; fi; # check return value, break if successful (0)
+                sleep 2s;
+              done;
+              unzip ./awscli-exe-linux-${!LINUX_ARCH_TYPE}.zip
+              sudo ./aws/install
+              /usr/local/bin/aws --version
+
+              # https://docs.aws.amazon.com/systems-manager/latest/userguide/agent-install-ubuntu.html
+              sudo snap install amazon-ssm-agent --classic
+              sudo systemctl enable snap.amazon-ssm-agent.amazon-ssm-agent.service
+              sudo systemctl restart snap.amazon-ssm-agent.amazon-ssm-agent.service
+              mkdir -p /etc/systemd/system/snap.amazon-ssm-agent.amazon-ssm-agent.service.d
+              cat > /etc/systemd/system/snap.amazon-ssm-agent.amazon-ssm-agent.service.d/10-restart-always.conf <<EOF
+              [Service]
+              Restart=always
+              RestartSec=60s
+              EOF
+              sudo systemctl start --no-block snap.amazon-ssm-agent.amazon-ssm-agent.service
+
+              # https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/QuickStartEC2Instance.html
+              mkdir -p /tmp/install-cloudwatch-logs
+              while [ 1 ]; do
+                pushd /tmp/install-cloudwatch-logs
+                sudo rm -f ./amazon-cloudwatch-agent.deb || true;
+                wget --quiet --retry-connrefused --waitretry=1 --read-timeout=20 --timeout=15 --tries=70 --continue https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/${ArchType}/latest/amazon-cloudwatch-agent.deb
+                popd
+                if [ $? = 0 ]; then break; fi; # check return value, break if successful (0)
+                sleep 2s;
+              done;
+              while [ 1 ]; do
+                echo "installing amazon-cloudwatch-agent"
+                pushd /tmp/install-cloudwatch-logs && sudo dpkg -i -E ./amazon-cloudwatch-agent.deb && popd
+                if [ $? = 0 ]; then break; fi; # check return value, break if successful (0)
+                sleep 2s;
+              done;
+
+              if [[ ${BlizzardDownloadSource} == "github" ]]; then
+                sudo rm -f ./blizzard-aws.${!LINUX_ARCH_TYPE}-${RustOsType}-linux-gnu
+                sudo rm -f /tmp/blizzard
+                sudo rm -f /usr/local/bin/blizzard
+                while [ 1 ]; do
+                  sudo rm -f ./blizzard-aws.${!LINUX_ARCH_TYPE}-${RustOsType}-linux-gnu || true;
+                  wget --quiet --retry-connrefused --waitretry=1 --read-timeout=20 --timeout=15 --tries=70 --continue https://github.com/ava-labs/avalanche-ops/releases/download/latest/blizzard-aws.${!LINUX_ARCH_TYPE}-${RustOsType}-linux-gnu
+                  if [ $? = 0 ]; then break; fi; # check return value, break if successful (0)
+                  sleep 2s;
+                done;
+                mv ./blizzard-aws.${!LINUX_ARCH_TYPE}-${RustOsType}-linux-gnu /tmp/blizzard
+                chmod +x /tmp/blizzard
+                sudo mv /tmp/blizzard /usr/local/bin/blizzard
+              else
+                sudo rm -f /tmp/blizzard
+                AWS_RETRY_MODE=standard AWS_MAX_ATTEMPTS=7 aws s3 cp s3://${S3BucketName}/${Id}/install/blizzard /tmp/blizzard
+                chmod +x /tmp/blizzard
+                sudo mv /tmp/blizzard /usr/local/bin/blizzard
+              fi;
+              /usr/local/bin/blizzard --version
+
+              cat > /tmp/blizzard.service <<EOF
+              [Unit]
+              Description=Blizzard
+
+              [Service]
+              Type=exec
+              TimeoutStartSec=300
+              Restart=on-failure
+              RestartSec=5s
+              LimitNOFILE=40000
+              ExecStart=/usr/local/bin/blizzard
+              StandardOutput=append:/var/log/blizzard.log
+              StandardError=append:/var/log/blizzard.log
+
+              [Install]
+              WantedBy=multi-user.target
+              EOF
+              sudo mv /tmp/blizzard.service /etc/systemd/system/blizzard.service
+              sudo systemctl daemon-reload
+              sudo systemctl enable blizzard.service
+              sudo systemctl start --no-block blizzard.service
+
+              # enough time for "blizzard" to initialize cloudwatch configuration
+              sleep 10
+              echo "wait until /opt/aws/amazon-cloudwatch-agent/bin/config.json is written by blizzard"
+              while [[ ! -s /opt/aws/amazon-cloudwatch-agent/bin/config.json ]]
+                do
+                echo "waiting for /opt/aws/amazon-cloudwatch-agent/bin/config.json creation"
+                sleep 5
+              done
+
+              cat /opt/aws/amazon-cloudwatch-agent/bin/config.json
+              /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/bin/config.json -s
+              mkdir -p /etc/systemd/system/amazon-cloudwatch-agent.service.d
+              cat <<EOF > /etc/systemd/system/amazon-cloudwatch-agent.service.d/10-restart-always.conf
+              [Service]
+              Restart=always
+              RestartSec=60s
+              EOF
+
+              sudo timedatectl set-ntp on
+
+  # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-as-group.html
+  ASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: !Ref AsgMinInstancesInService
+        MaxBatchSize: 1
+        SuspendProcesses:
+          - HealthCheck
+          - ReplaceUnhealthy
+          - AZRebalance
+          - AlarmNotification
+          - ScheduledActions
+    Properties:
+      # AutoScalingGroupName: !Join ["-", [!Ref Id, !Ref NodeKind, !Ref ArchType]]
+      AutoScalingGroupName: !Ref AsgName
+      MinSize: !Ref AsgMinSize
+      MaxSize: !Ref AsgMaxSize
+      DesiredCapacity: !Ref AsgDesiredCapacity
+      VPCZoneIdentifier: !Ref PublicSubnetIds
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 120
+      MetricsCollection:
+        - Granularity: "1Minute"
+      Tags:
+        # we can either propagate these information
+        # via tags, blizzard CLI flags, blizzardup spec, etc.
+        # use tags for relatively static configurations
+        - Key: Name
+          PropagateAtLaunch: true
+          Value: !Join ["-", [!Ref Id, !Ref NodeKind, !Ref ArchType]]
+        - Key: ID
+          PropagateAtLaunch: true
+          Value: !Ref Id
+        - Key: ARCH_TYPE
+          Value: !Ref ArchType
+          PropagateAtLaunch: true
+        - Key: RUST_OS_TYPE
+          Value: !Ref RustOsType
+          PropagateAtLaunch: true
+        - Key: INSTANCE_MODE
+          PropagateAtLaunch: true
+          Value: !Ref InstanceMode
+        - Key: NODE_KIND
+          PropagateAtLaunch: true
+          Value: !Ref NodeKind
+        - Key: S3_BUCKET_NAME
+          PropagateAtLaunch: true
+          Value: !Ref S3BucketName
+        - Key: CLOUDWATCH_CONFIG_FILE_PATH
+          PropagateAtLaunch: true
+          Value: /opt/aws/amazon-cloudwatch-agent/bin/config.json
+        - Key: BLIZZARDUP_SPEC_PATH
+          PropagateAtLaunch: true
+          Value: /opt/blizzardup.yaml
+
+      # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-autoscaling-autoscalinggroup-mixedinstancespolicy.html
+      # https://aws.amazon.com/getting-started/hands-on/ec2-auto-scaling-spot-instances/
+      MixedInstancesPolicy:
+        # define balance between spot vs. on-demand
+        # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-autoscaling-autoscalinggroup-instancesdistribution.html
+        # https://ec2spotworkshops.com/launching_ec2_spot_instances/asg.html
+        InstancesDistribution:
+          OnDemandAllocationStrategy: "lowest-price"
+          # minimum amount of the Auto Scaling group's capacity that must be fulfilled by On-Demand Instances
+          OnDemandBaseCapacity: 0
+          # percentages of On-Demand Instances and Spot Instances for your additional capacity beyond OnDemandBaseCapacity
+          # 20 specifies 20% On-Demand Instances, 80% Spot Instances
+          # If set to 0, only Spot Instances are used.
+          # If set to 100, only On-Demand Instances are used.
+          OnDemandPercentageAboveBaseCapacity: !Ref OnDemandPercentageAboveBaseCapacity
+          SpotAllocationStrategy: "lowest-price"
+          # number of Spot Instance pools across which to allocate your Spot Instances
+          SpotInstancePools: 3
+        # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-autoscaling-autoscalinggroup-launchtemplate.html
+        LaunchTemplate:
+          LaunchTemplateSpecification:
+            LaunchTemplateId: !Ref ASGLaunchTemplate
+            Version: !GetAtt ASGLaunchTemplate.LatestVersionNumber
+          # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-autoscaling-autoscalinggroup-launchtemplateoverrides.html
+          Overrides:
+            - InstanceType: !Select [0, !Ref InstanceTypes]
+            - Fn::If:
+                - Has2InstanceTypes
+                - InstanceType: !Select [1, !Ref InstanceTypes]
+                - !Ref AWS::NoValue
+            - Fn::If:
+                - Has3InstanceTypes
+                - InstanceType: !Select [2, !Ref InstanceTypes]
+                - !Ref AWS::NoValue
+            - Fn::If:
+                - Has4InstanceTypes
+                - InstanceType: !Select [3, !Ref InstanceTypes]
+                - !Ref AWS::NoValue
+            - Fn::If:
+                - Has5InstanceTypes
+                - InstanceType: !Select [4, !Ref InstanceTypes]
+                - !Ref AWS::NoValue
+            - Fn::If:
+                - Has6InstanceTypes
+                - InstanceType: !Select [5, !Ref InstanceTypes]
+                - !Ref AWS::NoValue
+            - Fn::If:
+                - Has7InstanceTypes
+                - InstanceType: !Select [6, !Ref InstanceTypes]
+                - !Ref AWS::NoValue
+            - Fn::If:
+                - Has8InstanceTypes
+                - InstanceType: !Select [7, !Ref InstanceTypes]
+                - !Ref AWS::NoValue
+            - Fn::If:
+                - Has9InstanceTypes
+                - InstanceType: !Select [8, !Ref InstanceTypes]
+                - !Ref AWS::NoValue
+            - Fn::If:
+                - Has10InstanceTypes
+                - InstanceType: !Select [9, !Ref InstanceTypes]
+                - !Ref AWS::NoValue
+
+Outputs:
+  # same as "AutoScalingGroupName"
+  AsgLogicalId:
+    Value: !Ref ASG
